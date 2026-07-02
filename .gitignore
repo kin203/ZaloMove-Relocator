@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Editors and local agent state
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+~*
