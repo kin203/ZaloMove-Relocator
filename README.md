@@ -123,12 +123,6 @@ ZaloRelocator/
 
 Dự án được phát hành theo giấy phép [MIT](LICENSE).
 
-## GitHub Topics đề xuất
-
-Khi tạo repository, hãy thêm các topic sau trong phần **About**:
-
-`zalo` · `zalo-mover` · `zalo-relocator` · `zalomove` · `windows` · `ntfs-junction` · `disk-space` · `data-migration` · `python` · `tkinter`
-
 ## Tuyên bố
 
 Zalo là sản phẩm và nhãn hiệu của đơn vị sở hữu tương ứng. Dự án này không liên kết, không được tài trợ và không được xác nhận bởi Zalo. Người dùng tự chịu trách nhiệm sao lưu và kiểm tra dữ liệu của mình.
