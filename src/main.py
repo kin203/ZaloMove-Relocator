@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Zalo Relocator"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 COPY_WORKERS = min(8, max(4, os.cpu_count() or 4))
 
@@ -129,6 +129,17 @@ def is_admin() -> bool:
         return False
 
 
+def run_hidden(args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    """Run a child process without flashing a console window on Windows."""
+    if is_windows():
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs.setdefault("startupinfo", startupinfo)
+        kwargs.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return subprocess.run(args, **kwargs)
+
+
 def is_reparse_point(path: Path) -> bool:
     if not path.exists():
         return False
@@ -145,7 +156,7 @@ def remove_link(path: Path) -> None:
         return
     if is_windows():
         # rmdir on Windows removes a directory junction/symlink itself, not the target.
-        result = subprocess.run(["cmd", "/c", "rmdir", str(path)], capture_output=True, text=True)
+        result = run_hidden(["cmd", "/c", "rmdir", str(path)], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "rmdir failed").strip())
     else:
@@ -157,7 +168,7 @@ def create_junction(link_path: Path, target_path: Path) -> None:
         raise RuntimeError("This tool supports Windows NTFS junctions only.")
     link_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
+    result = run_hidden(
         ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path)],
         capture_output=True,
         text=True,
@@ -271,7 +282,7 @@ def get_processes() -> list[str]:
     if not is_windows():
         return []
     try:
-        result = subprocess.run(
+        result = run_hidden(
             ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=5
         )
         names = []
@@ -301,12 +312,11 @@ def get_running_zalo_processes() -> list[str]:
         "[Console]::WriteLine(($_.Name + '|' + $_.ExecutablePath)) } }"
     )
     try:
-        result = subprocess.run(
+        result = run_hidden(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True,
             text=True,
             timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         for line in result.stdout.splitlines():
             name, separator, executable = line.partition("|")
@@ -532,7 +542,7 @@ class App(tk.Tk):
         ttk.Label(header, text="Zalo Relocator", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Di chuyển dữ liệu Zalo khỏi ổ C, giữ đường dẫn cũ bằng NTFS junction. Clean-room, không dùng source gốc.",
+            text="Di chuyển dữ liệu Zalo khỏi ổ C, giữ đường dẫn cũ bằng NTFS junction.",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(4, 14))
 
