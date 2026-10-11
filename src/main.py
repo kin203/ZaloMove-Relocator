@@ -7,6 +7,7 @@ Windows only. Run as Administrator for best compatibility.
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import csv
 import os
 import queue
@@ -23,7 +24,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Zalo Relocator"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 COPY_WORKERS = min(8, max(4, os.cpu_count() or 4))
 
@@ -278,57 +279,232 @@ def human_size(size: int) -> str:
     return f"{size} B"
 
 
-def get_processes() -> list[str]:
+KNOWN_ZALO_EXE_NAMES = {
+    "zalo.exe",
+    "zaloexecutable.exe",
+    "zalocall.exe",
+    "zalocap.exe",
+    "zavimeet.exe",
+    "zalocrashhandler.exe",
+    "zalocrashhandler64.exe",
+    "zaloupdater.exe",
+}
+
+TOOL_EXCLUSION_KEYWORDS = (
+    "relocator",
+    "zalomove",
+    "zalo-move",
+    "zalo_move",
+    "zalo_relocator",
+)
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    name: str
+    path: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.name} (PID: {self.pid})"
+
+
+def is_self_or_tool_process(pid: int, name: str, path: str = "") -> bool:
+    if pid == os.getpid():
+        return True
+
+    name_lower = name.lower()
+    if any(kw in name_lower for kw in TOOL_EXCLUSION_KEYWORDS):
+        return True
+
+    path_lower = path.lower() if path else ""
+    if any(kw in path_lower for kw in TOOL_EXCLUSION_KEYWORDS):
+        return True
+
+    try:
+        current_exe = Path(sys.executable).resolve()
+        if name_lower == current_exe.name.lower():
+            if not path or Path(path).resolve() == current_exe:
+                return True
+    except Exception:
+        pass
+
+    try:
+        script_path = Path(sys.argv[0]).resolve()
+        if script_path.is_file() and name_lower == script_path.name.lower():
+            if not path or Path(path).resolve() == script_path:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def enumerate_windows_processes() -> list[tuple[int, str, str]]:
+    if not is_windows():
+        return []
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if h_snapshot == -1 or not h_snapshot:
+        return []
+
+    pe = PROCESSENTRY32W()
+    pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+
+    results: list[tuple[int, str, str]] = []
+    try:
+        if kernel32.Process32FirstW(h_snapshot, ctypes.byref(pe)):
+            while True:
+                pid = int(pe.th32ProcessID)
+                name = str(pe.szExeFile)
+                path = ""
+                if pid > 4:
+                    h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    if h_proc:
+                        try:
+                            buf = ctypes.create_unicode_buffer(1024)
+                            size = wintypes.DWORD(len(buf))
+                            if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                                path = buf.value
+                        finally:
+                            kernel32.CloseHandle(h_proc)
+                results.append((pid, name, path))
+                if not kernel32.Process32NextW(h_snapshot, ctypes.byref(pe)):
+                    break
+    finally:
+        kernel32.CloseHandle(h_snapshot)
+    return results
+
+
+def enumerate_tasklist_processes() -> list[tuple[int, str, str]]:
     if not is_windows():
         return []
     try:
         result = run_hidden(
             ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=5
         )
-        names = []
+        results: list[tuple[int, str, str]] = []
         for row in csv.reader(result.stdout.splitlines()):
-            if row:
-                names.append(row[0].lower())
-        return names
+            if len(row) >= 2:
+                name = row[0].strip()
+                try:
+                    pid = int(row[1].strip())
+                except ValueError:
+                    pid = 0
+                results.append((pid, name, ""))
+        return results
     except Exception:
         return []
 
 
-def get_running_zalo_processes() -> list[str]:
-    """Detect Zalo by process name and by executable location."""
-    matched = {
-        name
-        for name in get_processes()
-        if name.startswith("zalo") or name in {"zavimeet.exe", "zalocall.exe", "zalocap.exe"}
-    }
+def get_running_zalo_processes(
+    extra_target_base: Optional[Path] = None,
+) -> list[ProcessInfo]:
+    """Detect actual running Zalo processes, strictly excluding the relocator itself."""
     if not is_windows():
-        return sorted(matched)
+        return []
+
+    try:
+        raw_procs = enumerate_windows_processes()
+    except Exception:
+        raw_procs = []
+
+    if not raw_procs:
+        raw_procs = enumerate_tasklist_processes()
 
     install_root = str(ZALO_INSTALL_ROOT).lower().rstrip("\\") + "\\"
     updater_root = str(env_path("LOCALAPPDATA") / "zalo-updater").lower().rstrip("\\") + "\\"
-    script = (
-        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-        "ForEach-Object { if ($_.ExecutablePath) { "
-        "[Console]::WriteLine(($_.Name + '|' + $_.ExecutablePath)) } }"
-    )
-    try:
-        result = run_hidden(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        for line in result.stdout.splitlines():
-            name, separator, executable = line.partition("|")
-            executable_lower = executable.lower()
-            if separator and (
-                executable_lower.startswith(install_root)
-                or executable_lower.startswith(updater_root)
-            ):
-                matched.add(name.lower())
-    except Exception:
-        pass
-    return sorted(matched)
+    zalo_dirs = [install_root, updater_root]
+    if extra_target_base:
+        zalo_dirs.append(str(extra_target_base).lower().rstrip("\\") + "\\")
+
+    matched_by_pid: dict[int, ProcessInfo] = {}
+
+    for pid, name, path in raw_procs:
+        if is_self_or_tool_process(pid, name, path):
+            continue
+
+        name_lower = name.lower()
+        path_lower = path.lower().replace("/", "\\") if path else ""
+
+        # 1. Match known specific Zalo executables
+        if name_lower in KNOWN_ZALO_EXE_NAMES:
+            matched_by_pid[pid] = ProcessInfo(pid=pid, name=name, path=path)
+            continue
+
+        # 2. Match processes running out of Zalo installation/updater directories
+        if path_lower:
+            for zdir in zalo_dirs:
+                if path_lower.startswith(zdir):
+                    matched_by_pid[pid] = ProcessInfo(pid=pid, name=name, path=path)
+                    break
+
+    return sorted(matched_by_pid.values(), key=lambda p: (p.name.lower(), p.pid))
+
+
+def kill_zalo_processes(
+    processes: Optional[list[ProcessInfo]] = None,
+) -> tuple[int, list[str]]:
+    """Terminates running Zalo processes. Returns (killed_count, error_messages)."""
+    if processes is None:
+        processes = get_running_zalo_processes()
+    if not processes:
+        return 0, []
+
+    killed = 0
+    errors: list[str] = []
+    pids_to_kill = {
+        p.pid for p in processes if not is_self_or_tool_process(p.pid, p.name, p.path)
+    }
+
+    for pid in pids_to_kill:
+        try:
+            res = run_hidden(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                killed += 1
+            else:
+                PROCESS_TERMINATE = 0x0001
+                kernel32 = ctypes.windll.kernel32
+                h_proc = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if h_proc:
+                    try:
+                        if kernel32.TerminateProcess(h_proc, 1):
+                            killed += 1
+                        else:
+                            errors.append(f"PID {pid}: TerminateProcess failed")
+                    finally:
+                        kernel32.CloseHandle(h_proc)
+                else:
+                    err = (res.stderr or res.stdout or "").strip()
+                    if err and "not found" not in err.lower():
+                        errors.append(f"PID {pid}: {err}")
+        except Exception as exc:
+            errors.append(f"PID {pid}: {exc}")
+
+    return killed, errors
 
 
 def zalo_is_running() -> bool:
@@ -594,6 +770,7 @@ class App(tk.Tk):
         ttk.Button(btn_row, text="Chọn tất cả", command=self.select_all).pack(side="left")
         ttk.Button(btn_row, text="Bỏ chọn", command=self.clear_all).pack(side="left", padx=8)
         ttk.Button(btn_row, text="Refresh", command=self.refresh_status).pack(side="left")
+        ttk.Button(btn_row, text="Đóng Zalo", command=self.close_zalo_manually).pack(side="left", padx=8)
 
         ttk.Label(right, text="Chế độ thao tác", style="Card.TLabel").pack(anchor="w")
         modes = ttk.Frame(right, style="Card.TFrame")
@@ -730,20 +907,74 @@ class App(tk.Tk):
                 size = "-"
             self.tree.insert("", "end", values=(str(src), status, size))
         admin = "Admin: OK" if is_admin() else "Admin: NO — nên chạy Run as administrator để tạo junction ổn định."
-        running = "Zalo đang chạy — hãy tắt hẳn Zalo trước khi thao tác." if zalo_is_running() else "Zalo process: không thấy đang chạy."
+        running_procs = get_running_zalo_processes()
+        if running_procs:
+            names = ", ".join(sorted({p.name for p in running_procs}))
+            running = f"Zalo đang chạy ({names}) — hãy tắt Zalo hoặc nhấn 'Đóng Zalo' bên dưới."
+        else:
+            running = "Zalo process: không thấy đang chạy."
         self.status_var.set(f"{admin}\n{running}\nLưu ý: nên dùng đường dẫn ngắn, không dấu, không ký tự lạ, ví dụ D:\\Zalo.")
+
+    def close_zalo_manually(self) -> None:
+        running_processes = get_running_zalo_processes()
+        if not running_processes:
+            messagebox.showinfo(APP_NAME, "Hiện không có tiến trình Zalo nào đang chạy ngầm.")
+            return
+        names = ", ".join(sorted({p.name for p in running_processes}))
+        pids = ", ".join(str(p.pid) for p in running_processes)
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Phát hiện các tiến trình Zalo đang chạy:\n\n{names} (PID: {pids})\n\n"
+            "Bạn có chắc muốn đóng tất cả tiến trình Zalo này không?",
+            icon="question",
+        ):
+            return
+        self.log(f"Đang đóng các tiến trình Zalo ({names})...")
+        killed, _ = kill_zalo_processes(running_processes)
+        time.sleep(1)
+        self.refresh_status()
+        still_running = get_running_zalo_processes()
+        if still_running:
+            names_left = ", ".join(sorted({p.name for p in still_running}))
+            messagebox.showwarning(
+                APP_NAME,
+                f"Chưa thể tắt hết: {names_left}.\nHãy kiểm tra lại quyền Administrator hoặc Task Manager.",
+            )
+        else:
+            self.log(f"Đã đóng xong {killed} tiến trình Zalo.")
+            messagebox.showinfo(APP_NAME, "Đã đóng toàn bộ tiến trình Zalo thành công.")
 
     def confirm_preflight(self, destructive: bool = False) -> bool:
         running_processes = get_running_zalo_processes()
         if running_processes:
-            names = ", ".join(running_processes)
-            messagebox.showwarning(
+            names = ", ".join(sorted({p.name for p in running_processes}))
+            pids = ", ".join(str(p.pid) for p in running_processes)
+            confirm_kill = messagebox.askyesno(
                 APP_NAME,
-                "Zalo hoặc thành phần liên quan vẫn đang chạy:\n\n"
-                f"{names}\n\n"
-                "Hãy thoát Zalo hoàn toàn (kể cả biểu tượng ở khay hệ thống), rồi thử lại.",
+                "Zalo hoặc thành phần liên quan vẫn đang chạy ngầm:\n\n"
+                f"{names} (PID: {pids})\n\n"
+                "Cần đóng Zalo hoàn toàn để tránh khoá file hoặc mất dữ liệu.\n\n"
+                "Bạn có muốn công cụ TỰ ĐỘNG ĐÓNG các tiến trình Zalo này ngay không?\n"
+                "(Chọn 'No' nếu bạn muốn tự thoát thủ công)",
+                icon="warning",
             )
-            return False
+            if confirm_kill:
+                self.log(f"Đang đóng các tiến trình Zalo ({names})...")
+                killed, _ = kill_zalo_processes(running_processes)
+                time.sleep(1)
+                self.refresh_status()
+                still_running = get_running_zalo_processes()
+                if still_running:
+                    names_left = ", ".join(sorted({p.name for p in still_running}))
+                    messagebox.showwarning(
+                        APP_NAME,
+                        f"Chưa thể tắt hết tiến trình Zalo: {names_left}.\n"
+                        "Vui lòng tắt Zalo trong Task Manager hoặc khay hệ thống rồi thử lại.",
+                    )
+                    return False
+                self.log(f"Đã đóng thành công {killed} tiến trình Zalo.")
+            else:
+                return False
         if not is_windows():
             messagebox.showerror(APP_NAME, "Tool này chỉ dành cho Windows.")
             return False
@@ -848,9 +1079,27 @@ class App(tk.Tk):
         if not is_windows():
             messagebox.showerror(APP_NAME, "Tính năng này chỉ dành cho Windows.")
             return
-        if zalo_is_running():
-            messagebox.showwarning(APP_NAME, "Hãy tắt hoàn toàn Zalo trước khi dọn phiên bản cũ.")
-            return
+        running_processes = get_running_zalo_processes()
+        if running_processes:
+            names = ", ".join(sorted({p.name for p in running_processes}))
+            confirm_kill = messagebox.askyesno(
+                APP_NAME,
+                f"Phát hiện Zalo đang chạy ({names}).\n\n"
+                "Cần đóng Zalo trước khi dọn phiên bản cũ.\n"
+                "Bạn có muốn tự động đóng Zalo ngay không?",
+                icon="warning",
+            )
+            if confirm_kill:
+                self.log(f"Đang đóng các tiến trình Zalo ({names})...")
+                killed, _ = kill_zalo_processes(running_processes)
+                time.sleep(1)
+                self.refresh_status()
+                if zalo_is_running():
+                    messagebox.showwarning(APP_NAME, "Chưa tắt được Zalo. Vui lòng tắt thủ công rồi thử lại.")
+                    return
+                self.log(f"Đã đóng {killed} tiến trình Zalo.")
+            else:
+                return
         versions = installed_zalo_versions()
         if len(versions) < 2:
             messagebox.showinfo(APP_NAME, "Không tìm thấy phiên bản Zalo cũ để dọn.")

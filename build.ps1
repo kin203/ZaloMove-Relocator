@@ -10,3 +10,5 @@ pyinstaller --noconsole --onefile --name ZaloRelocator `
     --exclude-module pydoc `
     .\src\main.py
 Write-Host "Build done: dist\ZaloRelocator.exe"
+Copy-Item .\dist\ZaloRelocator.exe .\dist\zalorelocator.v1.2.2.exe -Force
+Write-Host "Created versioned binary: dist\zalorelocator.v1.2.2.exe"
