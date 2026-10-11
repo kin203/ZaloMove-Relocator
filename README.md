@@ -1,102 +1,111 @@
-# Zalo Relocator — Zalo Mover for Windows
+# Zalo Relocator — Zalo Mover for Windows (v1.3.2)
 
-Ứng dụng Windows giúp **di chuyển dữ liệu Zalo Desktop** khỏi ổ C sang ổ đĩa khác, sau đó tạo NTFS junction để Zalo tiếp tục sử dụng đường dẫn cũ như bình thường. Phù hợp khi cần giải phóng ổ C, chuyển ZaloData sang ổ D hoặc tìm một công cụ Zalo mover có chế độ backup an toàn.
+Ứng dụng Windows giúp **di chuyển dữ liệu Zalo Desktop** khỏi ổ C sang ổ đĩa khác, hoặc chuyển tiếp giữa các ổ đĩa (ví dụ từ ổ D sang ổ F khi nâng cấp/thay ổ cứng), sau đó tự động tạo hoặc cập nhật NTFS junction để Zalo tiếp tục sử dụng đường dẫn cũ như bình thường.
 
-**English:** A lightweight Zalo data mover for Windows. Move Zalo Desktop data to another drive, preserve the original paths with NTFS junctions, restore backups, and clean old Zalo versions. An independent clean-room alternative for ZaloMove-style workflows.
+**English:** A lightweight, reliable Zalo data relocator for Windows. Move Zalo Desktop data from C: or between multiple secondary drives (e.g., D: to F: when upgrading drives), preserve original paths with NTFS junctions, manage & selectively delete backups, and clean old Zalo versions. An independent clean-room alternative for ZaloMove-style workflows.
 
 > Zalo Relocator là dự án clean-room độc lập, không chứa hoặc sử dụng mã nguồn của Zalo hay ZaloMove.
 
 ![Giao diện Zalo Relocator](assets/screenshot.png)
 
-## Tính năng
+---
 
-- Giao diện Tkinter nhẹ, không cần cài Python khi sử dụng bản `.exe`.
-- Tự nhận diện các thư mục Zalo phổ biến:
-  - `%LocalAppData%\Programs\Zalo`
-  - `%LocalAppData%\ZaloPC` — dữ liệu của một số phiên bản cũ
-  - `%AppData%\ZaloData`
-  - `%USERPROFILE%\Documents\Zalo Received Files`
-  - `%LocalAppData%\zalo-updater`
-- **Chế độ an toàn:** copy dữ liệu sang đích, đổi thư mục gốc thành `-Old`, rồi tạo junction.
-- **Chế độ move:** chuyển dữ liệu sang đích và tạo junction, không giữ backup `-Old`.
-- **Tạo lại liên kết:** sử dụng khi dữ liệu đã có trên ổ đĩa khác, chẳng hạn sau khi cài lại Windows.
-- Copy đa luồng với tối đa 8 I/O worker, phù hợp với bộ dữ liệu lớn.
-- Progress bar hiển thị phần trăm, dung lượng, tốc độ và thời gian dự kiến còn lại.
-- Nhận diện Zalo đang chạy theo tên process và đường dẫn file thực thi.
-- Khôi phục dữ liệu từ backup `-Old`.
-- Xoá backup `-Old` trực tiếp trong ứng dụng.
-- Tự mở Zalo sau khi di chuyển để người dùng kiểm tra.
-- Giữ hộp thoại xác nhận cho đến khi người dùng chọn xoá hoặc giữ backup.
-- Dọn các thư mục phiên bản Zalo cũ dạng `Zalo-x.y.z`, luôn giữ lại phiên bản mới nhất.
-- Ghi nhật ký tiến trình theo thời gian thực.
+## Tính năng nổi bật
 
-## Yêu cầu
+- **Giao diện hiện đại, tối ưu 3 chế độ chuyên biệt:**
+  - **1. Di chuyển sang ổ mới (Move / Đổi ổ cứng):** Hỗ trợ chuyển từ ổ C sang ổ khác hoặc chuyển tiếp giữa 2 ổ phụ (như D: sang F:).
+  - **2. Chỉ tạo lại liên kết (Relink):** Giao diện tinh gọn, chỉ hiển thị nút tạo liên kết — dùng khi vừa cài lại Windows hoặc dữ liệu đã có sẵn trên ổ phụ.
+  - **3. Khôi phục & Dọn dẹp:** Khôi phục dữ liệu về ổ C, chọn lọc xoá bản backup `-Old`, và dọn dẹp các phiên bản Zalo cũ.
+- **Tự động gom gọn vào thư mục con `Zalo` tại đích:**
+  - Tự động gói toàn bộ các thư mục (`Zalo`, `ZaloData`, `zalo-updater`...) vào một thư mục cha `Zalo` tại ổ đích thay vì rải rác ở thư mục gốc của ổ đĩa.
+  - Có dòng **Xem trước đường dẫn thực tế** theo thời gian thực.
+  - Xử lý thông minh, không bao giờ tạo thư mục trùng lặp như `Zalo\Zalo`.
+- **Cửa sổ Quản lý & Chọn lọc xoá Backup (`BackupManagerDialog`):**
+  - Tự động quét tìm tất cả các thư mục sao lưu `-Old` trên mọi ổ đĩa trong máy (`C:`, `D:`, `E:`, `F:`...).
+  - Cung cấp giao diện bảng tích chọn: Hiển thị chi tiết tên thư mục, dung lượng, ngày sửa đổi và đường dẫn đầy đủ.
+  - Người dùng có thể **chủ động tích chọn bản nào muốn xoá, bản nào muốn giữ lại** (các bản bỏ tích được bảo vệ an toàn 100%).
+  - Hỗ trợ nút *Chọn tất cả*, *Bỏ chọn tất cả* và tính năng *📁 Quét thêm thư mục khác...* để quét thêm các ổ cứng ngoài hoặc thư mục lưu trữ riêng.
+- **Chống lỗi đệ quy lặp vô tận:**
+  - Tự động xử lý an toàn khi thư mục đích nằm bên trong thư mục nguồn (ví dụ di chuyển từ `F:\Zalo` vào `F:\Zalo\Zalo`).
+  - Prune đường dẫn đích trong luồng quét `copytree_merge`, ngăn chặn hoàn toàn lỗi `maximum recursion depth exceeded`.
+- **Tự nhận diện các thư mục Zalo chuẩn:**
+  - `%LocalAppData%\Programs\Zalo` (Bộ cài ứng dụng)
+  - `%LocalAppData%\ZaloPC` (Dữ liệu/cache của một số bản cũ)
+  - `%AppData%\ZaloData` (Dữ liệu người dùng, tin nhắn)
+  - `%USERPROFILE%\Documents\Zalo Received Files` (File nhận qua Zalo)
+  - `%LocalAppData%\zalo-updater` (Bộ cập nhật Zalo)
+- **Nhận diện tiến trình Zalo chuẩn xác:**
+  - Dùng Win32 Toolhelp Snapshot API, loại trừ PID của công cụ, không bao giờ nhận diện nhầm chính mình.
+  - Có nút **Đóng Zalo** trực tiếp trên giao diện để tắt Zalo nhanh chóng trước khi thao tác.
+- **Sao chép an toàn & hiệu năng cao:**
+  - Copy đa luồng với tối đa 8 I/O worker, phù hợp với lượng dữ liệu hàng chục GB.
+  - Thanh tiến trình hiển thị phần trăm, dung lượng, tốc độ (MB/s) và ước tính thời gian còn lại (ETA).
+- **Tự động xử lý phân quyền Windows:**
+  - Tự gỡ cờ Read-Only trên các file SQLite/cache khi xoá backup để không gặp lỗi phân quyền.
+
+---
+
+## Yêu cầu hệ thống
 
 - Windows 10 hoặc Windows 11, 64-bit.
-- Nên chạy bằng **Run as administrator** để tạo junction ổn định.
-- Ổ đĩa đích nên dùng NTFS.
-- Phải thoát hoàn toàn Zalo trước khi di chuyển, khôi phục hoặc dọn phiên bản cũ.
+- Chạy bằng quyền **Run as administrator** để tạo và cập nhật NTFS junction ổn định.
+- Ổ đĩa đích định dạng NTFS.
+- Khuyến nghị đóng Zalo trước khi thao tác (hoặc dùng nút **Đóng Zalo** có sẵn trong tool).
 
-Người sử dụng file `.exe` không cần cài Python hay Tkinter.
+---
 
-## Sử dụng bản EXE
+## Hướng dẫn sử dụng
 
-1. Tải `ZaloRelocator.exe` từ mục Releases.
-2. Thoát hoàn toàn Zalo, kể cả biểu tượng Zalo trong khay hệ thống.
-3. Nhấp chuột phải vào file và chọn **Run as administrator**.
-4. Chọn thư mục đích, ví dụ `D:\Zalo`.
-5. Giữ **Chế độ an toàn** trong lần di chuyển đầu tiên.
-6. Chọn các thư mục cần xử lý và bấm **TỰ ĐỘNG DI CHUYỂN**.
-7. Khi Zalo được mở lại, kiểm tra đăng nhập, tin nhắn, hình ảnh và việc gửi/nhận file.
-8. Chỉ xác nhận xoá `-Old` khi chắc chắn Zalo hoạt động bình thường; nếu chưa chắc, chọn giữ lại.
+### 1. Di chuyển sang ổ mới (Lần đầu hoặc khi thay ổ cứng)
+1. Tải file chạy `zalorelocator.v1.3.2.exe` (hoặc `ZaloRelocator.exe`) từ mục Releases.
+2. Nhấp chuột phải vào file và chọn **Run as administrator**.
+3. Tại ô **Thư mục đích**, chọn ổ đĩa hoặc thư mục bạn muốn lưu (ví dụ `D:\Zalo` hoặc `F:\`).
+   - Giữ tích chọn **Tự động gom trọn các thư mục vào thư mục con 'Zalo' tại đích**.
+4. Chọn chế độ **Di chuyển sang ổ mới (Move / Đổi ổ cứng)**:
+   - *Sao chép an toàn (khuyên dùng):* Giữ bản sao lưu `-Old` tại ổ cũ để kiểm tra.
+   - *Tạo / Cập nhật liên kết (junction):* Mặc định bật để Zalo hoạt động ngay.
+5. Nhấn **BẮT ĐẦU DI CHUYỂN**.
+6. Sau khi hoàn tất, Zalo sẽ tự động mở lên. Bạn kiểm tra tin nhắn, đăng nhập và gửi file.
+7. Khi Zalo hoạt động bình thường, bạn có thể mở bảng quản lý backup để chọn xoá các bản `-Old` nhằm giải phóng ổ đĩa.
 
-## Chạy từ mã nguồn
+### 2. Chỉ tạo lại liên kết (Relink)
+Dùng khi bạn **vừa cài lại Windows** hoặc **dữ liệu Zalo đã có sẵn trên ổ phụ**:
+1. Chọn chế độ **Chỉ tạo lại liên kết (Relink)**.
+2. Chọn đúng thư mục chứa Zalo trên ổ phụ (ví dụ `D:\Zalo`).
+3. Bấm **TẠO LẠI LIÊN KẾT (RELINK)**. Tool sẽ tạo lại toàn bộ junction ở ổ C: trỏ tới ổ phụ trong 1 giây mà không cần copy lại dữ liệu.
 
-Yêu cầu Python 3.9 trở lên:
+### 3. Khôi phục & Dọn dẹp
+1. Chọn chế độ **Khôi phục & Dọn dẹp**.
+2. Tuỳ chọn các thao tác:
+   - **Khôi phục dữ liệu về ổ C:** Chép ngược dữ liệu từ ổ phụ về lại ổ C mặc định.
+   - **Xoá các thư mục backup -Old:** Mở bảng quản lý để chọn lọc xoá các bản backup `-Old` trên máy.
+   - **Dọn phiên bản Zalo cũ:** Quét và xoá các thư mục cài đặt phiên bản cũ dạng `Zalo-x.y.z`, luôn giữ lại phiên bản mới nhất.
+
+---
+
+## Chạy từ mã nguồn & Tự Build
+
+### Yêu cầu:
+Python 3.9+ trên Windows.
 
 ```powershell
-git clone <repository-url>
-cd ZaloRelocator
+git clone https://github.com/kin203/ZaloMove-Relocator.git
+cd ZaloMove-Relocator
 python .\src\main.py
 ```
 
-## Build file EXE
-
-Chạy script build có sẵn:
+### Build file EXE:
+Chạy script build tự động:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+.\build.ps1
 ```
 
-Script sẽ cài PyInstaller, nhúng icon ứng dụng và tạo:
+Tệp thực thi độc lập sẽ được tạo tại `dist\zalorelocator.v1.3.2.exe` và `dist\ZaloRelocator.exe`.
 
-```text
-dist\ZaloRelocator.exe
-```
+---
 
-## Các chế độ hoạt động
-
-### An toàn — khuyên dùng
-
-```text
-Copy sang đích → đổi thư mục gốc thành -Old → tạo junction → mở Zalo kiểm tra
-```
-
-Nếu Zalo chưa hoạt động ổn định, có thể dùng chức năng **Khôi phục từ -Old**.
-
-### Move
-
-```text
-Move sang đích → tạo junction → mở Zalo kiểm tra
-```
-
-Chế độ này tiết kiệm dung lượng ngay nhưng không tạo backup tại đường dẫn cũ.
-
-### Tạo lại liên kết
-
-Dùng khi dữ liệu đã tồn tại tại thư mục đích. Công cụ sẽ tạo lại junction tại đường dẫn Zalo mặc định mà không copy dữ liệu lần nữa.
-
-## Cấu trúc project
+## Cấu trúc thư mục
 
 ```text
 ZaloRelocator/
@@ -111,18 +120,20 @@ ZaloRelocator/
 └─ README.md
 ```
 
+---
+
 ## Lưu ý an toàn
 
-- Luôn sao lưu dữ liệu quan trọng trước khi thao tác.
-- Không tắt máy hoặc kết thúc ứng dụng khi đang copy/move.
-- Không xoá `-Old` trước khi kiểm tra Zalo hoạt động ổn định.
-- Không chạy file `Uninstall Zalo.exe` bên trong thư mục phiên bản cũ; hãy dùng chức năng dọn phiên bản của công cụ.
-- Tốc độ thực tế phụ thuộc vào ổ nguồn, ổ đích, số lượng file nhỏ và phần mềm antivirus.
+- Luôn kiểm tra Zalo hoạt động đầy đủ (đăng nhập, tin nhắn, ảnh) trước khi xoá các bản sao lưu `-Old`.
+- Không tắt máy hay ngắt nguồn khi quá trình sao chép đang diễn ra.
+- Tốc độ sao chép phụ thuộc vào tốc độ ổ đĩa (HDD/SSD/NVMe) và phần mềm diệt virus trên máy bạn.
 
-## Giấy phép
+---
 
-Dự án được phát hành theo giấy phép [MIT](LICENSE).
+## Giấy phép (License)
 
-## Tuyên bố
+Dự án được phát hành theo giấy phép [MIT License](LICENSE).
 
-Zalo là sản phẩm và nhãn hiệu của đơn vị sở hữu tương ứng. Dự án này không liên kết, không được tài trợ và không được xác nhận bởi Zalo. Người dùng tự chịu trách nhiệm sao lưu và kiểm tra dữ liệu của mình.
+## Tuyên bố miễn trừ trách nhiệm (Disclaimer)
+
+Zalo là sản phẩm và nhãn hiệu đã đăng ký của VNG Corporation. Dự án này là công cụ nguồn mở độc lập, không liên kết, không được tài trợ và không đại diện cho Zalo hoặc VNG. Người dùng tự chịu trách nhiệm sao lưu và kiểm tra dữ liệu của mình.
