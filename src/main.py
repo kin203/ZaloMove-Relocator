@@ -9,22 +9,25 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import csv
+import datetime
 import os
 import queue
 import re
 import shutil
+import stat
+import string
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Union
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Zalo Relocator"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.2"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 COPY_WORKERS = min(8, max(4, os.cpu_count() or 4))
 
@@ -142,8 +145,6 @@ def run_hidden(args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
 
 
 def is_reparse_point(path: Path) -> bool:
-    if not path.exists():
-        return False
     try:
         stat_result = path.lstat()
         attrs = getattr(stat_result, "st_file_attributes", 0)
@@ -152,14 +153,140 @@ def is_reparse_point(path: Path) -> bool:
         return False
 
 
+def get_junction_target(path: Path) -> Optional[Path]:
+    """Get the target path of an NTFS junction or symlink."""
+    if not is_reparse_point(path):
+        return None
+    try:
+        raw = os.readlink(str(path))
+        clean = raw.removeprefix("\\\\?\\")
+        return Path(clean)
+    except Exception:
+        try:
+            return path.resolve()
+        except Exception:
+            return None
+
+
+def get_effective_data_path(item: ZaloFolder) -> Optional[Path]:
+    """Return the folder path containing actual data (source on C:, or target if already linked)."""
+    src = item.source
+    if is_reparse_point(src):
+        target = get_junction_target(src)
+        if target and target.exists():
+            return target
+        return None
+    if src.exists():
+        return src
+    return None
+
+
+def remove_dir_force(path: Path) -> None:
+    """Robust directory removal that clears read-only attributes on Windows."""
+    def _onerror(func: Callable, p: str, exc_info: tuple) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=_onerror)
+
+
+def find_all_zalo_backups(
+    folders: Iterable[ZaloFolder],
+    target_base: Optional[Path] = None,
+    extra_dirs: Optional[Iterable[Path]] = None,
+) -> list[Path]:
+    """Find all Zalo backup folders (-Old) across C: drive, target bases, previous junction targets, and drive roots."""
+    folders_list = list(folders)
+    candidates: set[Path] = set()
+
+    # 1. Standard C: drive backup locations
+    for item in folders_list:
+        candidates.add(item.backup_path())
+
+    bases_to_check: set[Path] = set()
+
+    # 2. Existing junction targets (e.g. if C points to D:\Zalo\... or F:\Zalo\...)
+    for item in folders_list:
+        if is_reparse_point(item.source):
+            target = get_junction_target(item.source)
+            if target:
+                bases_to_check.add(target.parent)
+                candidates.add(target.with_name(target.name + "-Old"))
+
+    # 3. Destination folder configured in app
+    if target_base:
+        bases_to_check.add(target_base)
+        bases_to_check.add(target_base.parent)
+
+    # 4. Extra paths (e.g. last source bases)
+    if extra_dirs:
+        for d in extra_dirs:
+            if d:
+                bases_to_check.add(d)
+                bases_to_check.add(d.parent)
+
+    # 5. Scan available drive roots and [Drive]:\Zalo (e.g. D:\Zalo, E:\Zalo...)
+    if is_windows():
+        for letter in string.ascii_uppercase:
+            zalo_dir = Path(f"{letter}:/Zalo")
+            drive_root = Path(f"{letter}:/")
+            try:
+                if zalo_dir.is_dir():
+                    bases_to_check.add(zalo_dir)
+                if drive_root.is_dir():
+                    bases_to_check.add(drive_root)
+            except Exception:
+                pass
+
+    old_names = {f"{item.target_name.lower()}-old" for item in folders_list}
+    old_names.update({f"{item.source.name.lower()}-old" for item in folders_list})
+
+    for base in bases_to_check:
+        if base and base.exists() and base.is_dir():
+            try:
+                for sub in base.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    sub_lower = sub.name.lower()
+                    if sub_lower in old_names or (
+                        sub_lower.endswith("-old")
+                        and any(item.target_name.lower() in sub_lower for item in folders_list)
+                    ):
+                        candidates.add(sub)
+            except Exception:
+                pass
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for c in sorted(candidates):
+        try:
+            resolved = c.resolve()
+            if resolved in seen:
+                continue
+            if c.exists() and c.is_dir():
+                seen.add(resolved)
+                found.append(c)
+        except Exception:
+            pass
+    return found
+
+
 def remove_link(path: Path) -> None:
-    if not path.exists() and not is_reparse_point(path):
+    try:
+        path.lstat()
+    except OSError:
         return
     if is_windows():
         # rmdir on Windows removes a directory junction/symlink itself, not the target.
         result = run_hidden(["cmd", "/c", "rmdir", str(path)], capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout or "rmdir failed").strip())
+            try:
+                path.unlink()
+            except Exception:
+                raise RuntimeError((result.stderr or result.stdout or "rmdir failed").strip())
     else:
         path.unlink()
 
@@ -187,6 +314,11 @@ def copytree_merge(
     """Merge-copy a tree with bounded worker memory and byte progress."""
     if not src.exists():
         return
+    resolved_src = src.resolve()
+    resolved_dst = dst.resolve()
+    if resolved_dst == resolved_src:
+        return
+
     dst.mkdir(parents=True, exist_ok=True)
     jobs: queue.Queue[Optional[tuple[Path, Path, int]]] = queue.Queue(
         maxsize=COPY_WORKERS * 4
@@ -231,6 +363,12 @@ def copytree_merge(
     if log:
         log(f"Bắt đầu copy với {COPY_WORKERS} luồng I/O.")
     for root, dirs, files in os.walk(src):
+        # Exclude dst and subdirectories of dst to prevent infinite recursion
+        dirs[:] = [
+            d for d in dirs
+            if (Path(root) / d).resolve() != resolved_dst
+            and not (Path(root) / d).resolve().is_relative_to(resolved_dst)
+        ]
         root_path = Path(root)
         dst_root = dst / root_path.relative_to(src)
         dst_root.mkdir(parents=True, exist_ok=True)
@@ -260,7 +398,8 @@ def folder_size(path: Path) -> int:
     if not path.exists() or is_reparse_point(path):
         return 0
     total = 0
-    for root, _, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not is_reparse_point(Path(root) / d)]
         for f in files:
             try:
                 total += (Path(root) / f).stat().st_size
@@ -522,18 +661,31 @@ class Worker:
         self.completed_bytes = 0
         self.total_bytes = 0
         self._progress_lock = threading.Lock()
+        self.created_backups: list[Path] = []
+        self.source_bases: list[Path] = []
 
-    def move_selected(self, folders: Iterable[ZaloFolder], base: Path, mode: str) -> None:
+    def move_selected(
+        self,
+        folders: Iterable[ZaloFolder],
+        base: Path,
+        mode: str,
+        create_link: bool = True,
+    ) -> None:
         folders = list(folders)
         base.mkdir(parents=True, exist_ok=True)
         if mode == "copy_safe":
             self.log("Đang tính tổng dung lượng để ước lượng thời gian...")
-            self.total_bytes = sum(folder_size(item.source) for item in folders)
+            total = 0
+            for item in folders:
+                eff = get_effective_data_path(item)
+                if eff and eff.exists():
+                    total += folder_size(eff)
+            self.total_bytes = total
             if self.progress:
                 self.progress(0, self.total_bytes, "Chuẩn bị copy")
         for item in folders:
-            self._move_one(item, base, mode)
-        self.log("Hoàn tất. Nên mở Zalo kiểm tra trước khi xoá thư mục -Old.")
+            self._move_one(item, base, mode, create_link)
+        self.log("Hoàn tất di chuyển. Nên mở Zalo kiểm tra trước khi xoá thư mục -Old.")
 
     def _add_copied_bytes(self, amount: int) -> None:
         with self._progress_lock:
@@ -542,88 +694,206 @@ class Worker:
         if self.progress:
             self.progress(completed, self.total_bytes, "Đang copy")
 
-    def _move_one(self, item: ZaloFolder, base: Path, mode: str) -> None:
+    def _move_one(
+        self,
+        item: ZaloFolder,
+        base: Path,
+        mode: str,
+        create_link: bool = True,
+    ) -> None:
         src = item.source
         dst = item.target(base)
         bak = item.backup_path()
         self.log(f"--- {item.label} ---")
-        self.log(f"Gốc: {src}")
-        self.log(f"Đích: {dst}")
 
-        if is_reparse_point(src):
-            self.log("Đã là liên kết. Bỏ qua.")
-            return
+        # Xác định vị trí dữ liệu thực tế hiện tại
+        is_linked = is_reparse_point(src)
+        old_target = get_junction_target(src) if is_linked else None
 
-        if mode == "relink":
-            if not dst.exists():
-                self.log("Không có dữ liệu ở đích để tạo lại liên kết. Bỏ qua.")
-                return
-            if src.exists():
-                if bak.exists():
-                    raise RuntimeError(f"Backup đã tồn tại: {bak}")
-                src.rename(bak)
-                self.log(f"Đổi thư mục gốc thành backup: {bak}")
-            create_junction(src, dst)
-            self.log("Đã tạo liên kết lại.")
-            return
-
-        if not src.exists():
-            if dst.exists():
-                create_junction(src, dst)
-                self.log("Nguồn không tồn tại nhưng đích có dữ liệu, đã tạo liên kết.")
+        if is_linked:
+            if old_target and old_target.exists():
+                actual_src = old_target
+                self.log(f"Vị trí dữ liệu hiện tại (qua liên kết cũ): {actual_src}")
             else:
-                self.log("Không thấy thư mục nguồn. Bỏ qua.")
+                self.log(f"CẢNH BÁO: Liên kết hiện tại bị lỗi hoặc ổ cũ không kết nối: {old_target}")
+                actual_src = None
+        elif src.exists():
+            actual_src = src
+            self.log(f"Vị trí dữ liệu hiện tại (thư mục gốc ở C): {actual_src}")
+        else:
+            actual_src = None
+
+        self.log(f"Vị trí đích mới: {dst}")
+
+        if not actual_src:
+            if dst.exists():
+                if create_link:
+                    if is_linked:
+                        remove_link(src)
+                    create_junction(src, dst)
+                    self.log(f"Nguồn không có nhưng đích có dữ liệu, đã tạo liên kết: {src} -> {dst}")
+                else:
+                    self.log("Không có dữ liệu nguồn. Bỏ qua.")
+            else:
+                self.log("Không tìm thấy dữ liệu nguồn để di chuyển. Bỏ qua.")
             return
+
+        try:
+            if actual_src.resolve() == dst.resolve():
+                self.log("Thư mục đích trùng với vị trí hiện tại. Bỏ qua sao chép.")
+                if create_link and not is_linked:
+                    if bak.exists():
+                        raise RuntimeError(f"Backup đã tồn tại: {bak}")
+                    src.rename(bak)
+                    self.created_backups.append(bak)
+                    create_junction(src, dst)
+                    self.log(f"Đã tạo liên kết: {src} -> {dst}")
+                return
+
+            if dst.resolve().is_relative_to(actual_src.resolve()):
+                old_bak = actual_src.with_name(actual_src.name + "-Old")
+                if old_bak.exists():
+                    old_bak = actual_src.with_name(actual_src.name + f"-Old-{int(time.time())}")
+                self.log(f"Đích nằm trong thư mục nguồn, tự động đổi nguồn thành backup trước: {old_bak}")
+                actual_src.rename(old_bak)
+                self.created_backups.append(old_bak)
+                self.source_bases.append(old_bak.parent)
+                actual_src = old_bak
+        except Exception as exc:
+            self.log(f"Lưu ý khi kiểm tra đường dẫn nguồn/đích: {exc}")
 
         if mode == "copy_safe":
-            copytree_merge(src, dst, self.log, self._add_copied_bytes)
-            if bak.exists():
-                raise RuntimeError(f"Không thể đổi tên vì backup đã tồn tại: {bak}")
-            src.rename(bak)
-            self.log(f"Đã giữ backup: {bak}")
-            create_junction(src, dst)
-            self.log("Đã tạo liên kết.")
-            return
+            self.log(f"Đang sao chép an toàn từ {actual_src} sang {dst}...")
+            copytree_merge(actual_src, dst, self.log, self._add_copied_bytes)
 
-        if mode == "move":
+            if not is_linked:
+                if bak.exists():
+                    raise RuntimeError(f"Không thể đổi tên vì backup đã tồn tại: {bak}")
+                actual_src.rename(bak)
+                self.created_backups.append(bak)
+                self.source_bases.append(actual_src.parent)
+                self.log(f"Đã đổi thư mục gốc thành backup: {bak}")
+            else:
+                if not str(actual_src.name).endswith("-Old") and "-Old-" not in actual_src.name:
+                    old_bak = actual_src.with_name(actual_src.name + "-Old")
+                    if not old_bak.exists():
+                        try:
+                            actual_src.rename(old_bak)
+                            self.created_backups.append(old_bak)
+                            self.source_bases.append(actual_src.parent)
+                            self.log(f"Đã đổi thư mục ổ cũ thành backup: {old_bak}")
+                        except Exception as exc:
+                            self.log(f"Không đổi tên được thư mục ổ cũ (giữ nguyên): {exc}")
+
+        elif mode == "move":
             if dst.exists() and any(dst.iterdir()):
                 raise RuntimeError(f"Đích đã có dữ liệu, không move đè: {dst}")
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
-            self.log("Đã move dữ liệu sang đích.")
-            create_junction(src, dst)
-            self.log("Đã tạo liên kết.")
-            return
+            self.log(f"Đang di chuyển từ {actual_src} sang {dst}...")
+            shutil.move(str(actual_src), str(dst))
+            self.source_bases.append(actual_src.parent)
+            self.log("Đã di chuyển xong dữ liệu sang đích.")
+        else:
+            raise RuntimeError(f"Chế độ di chuyển không hợp lệ: {mode}")
 
-        raise RuntimeError(f"Unknown mode: {mode}")
+        if create_link:
+            if is_reparse_point(src):
+                remove_link(src)
+                self.log("Đã gỡ liên kết cũ ở ổ C.")
+            elif src.exists():
+                if bak.exists():
+                    raise RuntimeError(f"Backup đã tồn tại: {bak}")
+                src.rename(bak)
+                self.created_backups.append(bak)
+                self.log(f"Đổi thư mục gốc thành backup: {bak}")
+
+            create_junction(src, dst)
+            self.log(f"Đã tạo liên kết mới thành công: {src} -> {dst}")
+        else:
+            self.log("Tùy chọn tạo liên kết đang TẮT: Dữ liệu đã chuyển sang đích nhưng chưa tạo junction ở C.")
+
+    def relink_selected(self, folders: Iterable[ZaloFolder], base: Path) -> None:
+        folders = list(folders)
+        for item in folders:
+            src = item.source
+            dst = item.target(base)
+            bak = item.backup_path()
+            self.log(f"--- Tạo lại liên kết cho {item.label} ---")
+            self.log(f"Đường dẫn gốc (C:): {src}")
+            self.log(f"Đích liên kết: {dst}")
+
+            if not dst.exists():
+                self.log(f"BỎ QUA: Thư mục đích không tồn tại: {dst}")
+                continue
+
+            if is_reparse_point(src):
+                old_target = get_junction_target(src)
+                remove_link(src)
+                self.log(f"Đã gỡ liên kết cũ (từng trỏ tới {old_target}).")
+
+            if src.exists() and not is_reparse_point(src):
+                if bak.exists():
+                    raise RuntimeError(f"Backup đã tồn tại ở gốc: {bak}")
+                src.rename(bak)
+                self.created_backups.append(bak)
+                self.log(f"Đổi thư mục gốc thành backup: {bak}")
+
+            create_junction(src, dst)
+            self.log(f"Đã tạo liên kết thành công: {src} -> {dst}")
+        self.log("Hoàn tất tạo lại liên kết.")
 
     def restore_selected(self, folders: Iterable[ZaloFolder]) -> None:
         for item in folders:
             src = item.source
             bak = item.backup_path()
-            self.log(f"--- Restore {item.label} ---")
+            self.log(f"--- Khôi phục {item.label} ---")
+            target_on_other_drive = None
             if is_reparse_point(src):
+                target_on_other_drive = get_junction_target(src)
                 remove_link(src)
-                self.log("Đã xoá liên kết.")
+                self.log(f"Đã xoá liên kết ở ổ C (từng trỏ tới {target_on_other_drive}).")
+
             if bak.exists() and not src.exists():
                 bak.rename(src)
-                self.log(f"Đã khôi phục: {src}")
-            elif bak.exists() and src.exists():
-                self.log("Có backup nhưng thư mục gốc đang tồn tại, không ghi đè.")
+                self.log(f"Đã khôi phục từ backup -Old: {src}")
+            elif not src.exists() and target_on_other_drive and target_on_other_drive.exists():
+                self.log(f"Đang chép dữ liệu từ ổ phụ ({target_on_other_drive}) về lại ổ C ({src})...")
+                copytree_merge(target_on_other_drive, src, self.log)
+                self.log(f"Đã khôi phục dữ liệu về lại ổ C: {src}")
+            elif src.exists():
+                self.log("Thư mục gốc ở ổ C đang tồn tại, không ghi đè.")
             else:
-                self.log("Không có backup -Old để khôi phục.")
-        self.log("Restore hoàn tất.")
+                self.log("Không có backup hoặc dữ liệu để khôi phục.")
+        self.log("Khôi phục hoàn tất.")
 
-    def delete_backups(self, folders: Iterable[ZaloFolder]) -> None:
+    def delete_backup_paths(self, paths: Iterable[Path]) -> tuple[int, int]:
+        paths_list = list(paths)
+        deleted = 0
+        total_freed = 0
+        for p in paths_list:
+            self.log(f"--- Xoá backup: {p} ---")
+            if not p.exists():
+                self.log(f"Không tìm thấy: {p}")
+                continue
+            try:
+                sz = folder_size(p)
+                remove_dir_force(p)
+                deleted += 1
+                total_freed += sz
+                self.log(f"Đã xoá: {p} (giải phóng {human_size(sz)})")
+            except Exception as exc:
+                self.log(f"Lỗi khi xoá {p}: {exc}")
+        self.log(f"Xoá backup hoàn tất ({deleted}/{len(paths_list)} thư mục đã xoá, giải phóng {human_size(total_freed)}).")
+        return deleted, total_freed
+
+    def delete_backups(self, folders: Iterable[Union[ZaloFolder, Path]]) -> tuple[int, int]:
+        resolved: list[Path] = []
         for item in folders:
-            bak = item.backup_path()
-            self.log(f"--- Delete backup {item.label} ---")
-            if bak.exists():
-                shutil.rmtree(bak)
-                self.log(f"Đã xoá: {bak}")
-            else:
-                self.log("Không có backup.")
-        self.log("Xoá backup hoàn tất.")
+            if isinstance(item, Path):
+                resolved.append(item)
+            elif isinstance(item, ZaloFolder):
+                resolved.append(item.backup_path())
+        return self.delete_backup_paths(resolved)
 
 
     def clean_old_versions(self, root: Path = ZALO_INSTALL_ROOT) -> None:
@@ -638,6 +908,236 @@ class Worker:
             shutil.rmtree(path)
             self.log(f"Đã xoá: {path}")
         self.log("Dọn phiên bản Zalo cũ hoàn tất.")
+
+
+class BackupManagerDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        backups: list[Path],
+        on_delete_confirmed: Callable[[list[Path]], None],
+    ) -> None:
+        super().__init__(parent)
+        self.title("Quản lý & Xoá bản sao lưu Zalo (-Old)")
+        self.geometry("820x540")
+        self.minsize(700, 420)
+        self.configure(bg="#0f172a")
+        self.transient(parent)
+        self.grab_set()
+
+        self.on_delete_confirmed = on_delete_confirmed
+        self.backup_data: dict[str, dict] = {}
+
+        self._build_ui()
+        for p in backups:
+            self._add_path(p)
+        self._update_summary()
+
+        self.update_idletasks()
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_x()
+            py = parent.winfo_y()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + (ph - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _build_ui(self) -> None:
+        header = ttk.Frame(self, padding=(18, 14))
+        header.pack(fill="x")
+        ttk.Label(
+            header,
+            text="DANH SÁCH BẢN SAO LƯU ZALO (-OLD)",
+            font=("Segoe UI", 12, "bold"),
+            foreground="#f8fafc",
+            background="#0f172a",
+        ).pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Tích chọn các bản sao lưu bạn muốn xoá. Các bản bỏ tích sẽ được giữ nguyên an toàn trên máy.",
+            font=("Segoe UI", 9),
+            foreground="#94a3b8",
+            background="#0f172a",
+        ).pack(anchor="w", pady=(3, 0))
+
+        toolbar = ttk.Frame(self, padding=(18, 0, 18, 8))
+        toolbar.pack(fill="x")
+        ttk.Button(toolbar, text="Chọn tất cả", command=self._select_all).pack(side="left")
+        ttk.Button(toolbar, text="Bỏ chọn tất cả", command=self._deselect_all).pack(side="left", padx=8)
+        ttk.Button(toolbar, text="📁 Quét thêm thư mục khác...", command=self._scan_custom_dir).pack(side="left")
+
+        tree_frame = ttk.Frame(self, padding=(18, 0))
+        tree_frame.pack(fill="both", expand=True)
+
+        cols = ("check", "name", "size", "mtime", "path")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10)
+        self.tree.heading("check", text="Chọn")
+        self.tree.heading("name", text="Thư mục sao lưu")
+        self.tree.heading("size", text="Dung lượng")
+        self.tree.heading("mtime", text="Ngày sửa đổi")
+        self.tree.heading("path", text="Đường dẫn")
+
+        self.tree.column("check", width=55, anchor="center")
+        self.tree.column("name", width=140)
+        self.tree.column("size", width=90, anchor="e")
+        self.tree.column("mtime", width=125, anchor="center")
+        self.tree.column("path", width=360)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._on_space)
+
+        footer = ttk.Frame(self, padding=(18, 14))
+        footer.pack(fill="x")
+
+        self.summary_var = tk.StringVar()
+        ttk.Label(
+            footer,
+            textvariable=self.summary_var,
+            font=("Segoe UI", 10, "bold"),
+            foreground="#38bdf8",
+            background="#0f172a",
+        ).pack(anchor="w", pady=(0, 10))
+
+        btn_row = ttk.Frame(footer)
+        btn_row.pack(fill="x")
+
+        ttk.Button(
+            btn_row,
+            text="XOÁ CÁC BẢN ĐÃ CHỌN",
+            style="Accent.TButton",
+            command=self._confirm_and_delete,
+        ).pack(side="right")
+        ttk.Button(btn_row, text="Đóng / Giữ lại", command=self.destroy).pack(side="right", padx=8)
+
+    def _add_path(self, p: Path) -> None:
+        try:
+            resolved = p.resolve()
+        except Exception:
+            resolved = p
+        iid = str(resolved)
+        if iid in self.backup_data or not p.exists() or not p.is_dir():
+            return
+
+        size = folder_size(p)
+        try:
+            mtime_ts = p.stat().st_mtime
+            mtime_str = datetime.datetime.fromtimestamp(mtime_ts).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            mtime_str = "-"
+
+        self.backup_data[iid] = {
+            "path": p,
+            "size": size,
+            "mtime": mtime_str,
+            "checked": True,
+        }
+        self.tree.insert("", "end", iid=iid, values=(
+            "[ ✔ ]",
+            p.name,
+            human_size(size),
+            mtime_str,
+            str(p),
+        ))
+
+    def _on_tree_click(self, event: tk.Event) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self._toggle_item(item_id)
+
+    def _on_space(self, event: tk.Event) -> None:
+        sel = self.tree.selection()
+        if sel:
+            self._toggle_item(sel[0])
+
+    def _toggle_item(self, iid: str) -> None:
+        if iid in self.backup_data:
+            data = self.backup_data[iid]
+            data["checked"] = not data["checked"]
+            chk_symbol = "[ ✔ ]" if data["checked"] else "[   ]"
+            self.tree.set(iid, "check", chk_symbol)
+            self._update_summary()
+
+    def _select_all(self) -> None:
+        for iid, data in self.backup_data.items():
+            data["checked"] = True
+            self.tree.set(iid, "check", "[ ✔ ]")
+        self._update_summary()
+
+    def _deselect_all(self) -> None:
+        for iid, data in self.backup_data.items():
+            data["checked"] = False
+            self.tree.set(iid, "check", "[   ]")
+        self._update_summary()
+
+    def _scan_custom_dir(self) -> None:
+        folder = filedialog.askdirectory(title="Chọn thư mục để quét backup Zalo")
+        if folder:
+            path = Path(folder)
+            found = 0
+            if path.name.lower().endswith("-old") or "zalo" in path.name.lower():
+                self._add_path(path)
+                found += 1
+            try:
+                for sub in path.iterdir():
+                    if sub.is_dir() and (sub.name.lower().endswith("-old") or "zalo" in sub.name.lower()):
+                        self._add_path(sub)
+                        found += 1
+            except Exception:
+                pass
+            self._update_summary()
+            if found:
+                messagebox.showinfo(APP_NAME, f"Đã quét và thêm {found} thư mục từ {folder}.")
+            else:
+                messagebox.showinfo(APP_NAME, f"Không tìm thấy thư mục backup nào trong {folder}.")
+
+    def _update_summary(self) -> None:
+        selected = [d for d in self.backup_data.values() if d["checked"]]
+        total_size = sum(d["size"] for d in selected)
+        total_items = len(self.backup_data)
+        self.summary_var.set(
+            f"Đã chọn: {len(selected)} / {total_items} bản sao lưu  |  Tổng dung lượng giải phóng: {human_size(total_size)}"
+        )
+
+    def _confirm_and_delete(self) -> None:
+        selected_paths = [d["path"] for d in self.backup_data.values() if d["checked"]]
+        if not selected_paths:
+            messagebox.showwarning(APP_NAME, "Vui lòng tích chọn ít nhất 1 bản sao lưu để xoá.")
+            return
+
+        total_size = sum(
+            self.backup_data[str(p.resolve())]["size"]
+            for p in selected_paths
+            if str(p.resolve()) in self.backup_data
+        )
+        labels = "\n".join(
+            f"• {p.name} ({human_size(self.backup_data[str(p.resolve())]['size'])}): {p}"
+            for p in selected_paths
+        )
+
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Bạn có chắc chắn muốn XOÁ VĨNH VIỄN {len(selected_paths)} bản sao lưu đã chọn?\n\n"
+            f"{labels}\n\n"
+            f"Tổng dung lượng giải phóng: {human_size(total_size)}\n\n"
+            "Chỉ xoá khi bạn chắc chắn Zalo đã hoạt động tốt!",
+            icon="warning",
+            default=messagebox.NO,
+        ):
+            return
+
+        self.destroy()
+        self.on_delete_confirmed(selected_paths)
 
 
 class App(tk.Tk):
@@ -655,14 +1155,23 @@ class App(tk.Tk):
         self.queue: queue.Queue[object] = queue.Queue()
         self.vars: dict[str, tk.BooleanVar] = {}
         self.target_var = tk.StringVar(value=str(Path("D:/Zalo") if is_windows() else Path.home() / "Zalo"))
-        self.mode_var = tk.StringVar(value="copy_safe")
+        self.auto_subfolder_var = tk.BooleanVar(value=True)
+        self.target_preview_var = tk.StringVar()
+        self.last_migration_backups: list[Path] = []
+        self.last_source_bases: list[Path] = []
+        self.main_mode_var = tk.StringVar(value="migrate")
+        self.move_mode_var = tk.StringVar(value="copy_safe")
+        self.create_link_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar()
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="Sẵn sàng")
         self.progress_started_at: Optional[float] = None
         self.running = False
+        self.target_var.trace_add("write", lambda *_: self._update_target_preview())
+        self.auto_subfolder_var.trace_add("write", lambda *_: self._update_target_preview())
         self._setup_style()
         self._build_ui()
+        self._update_target_preview()
         self._set_initial_window_size()
         self.deiconify()
         self.after(200, self._poll_queue)
@@ -728,14 +1237,31 @@ class App(tk.Tk):
         entry = ttk.Entry(top, textvariable=self.target_var, font=("Segoe UI", 10))
         entry.grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 8))
         ttk.Button(top, text="Chọn...", command=self.choose_target).grid(row=1, column=1, padx=(0, 8))
-        ttk.Button(top, text="Mở đích", command=lambda: self.open_path(Path(self.target_var.get()))).grid(row=1, column=2)
+        ttk.Button(top, text="Mở đích", command=lambda: self.open_path(self.get_effective_target_base())).grid(row=1, column=2)
         top.columnconfigure(0, weight=1)
+
+        subfolder_check = ttk.Checkbutton(
+            top,
+            text="Tự động gom trọn các thư mục vào thư mục con 'Zalo' tại đích (Khuyên dùng)",
+            variable=self.auto_subfolder_var,
+            command=self._update_target_preview,
+        )
+        subfolder_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
+
+        self.target_preview_label = ttk.Label(
+            top,
+            textvariable=self.target_preview_var,
+            style="Small.Card.TLabel",
+            foreground="#38bdf8",
+        )
+        self.target_preview_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
         self.progress_bar = ttk.Progressbar(
             top, variable=self.progress_var, maximum=100, mode="determinate"
         )
-        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        self.progress_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         ttk.Label(top, textvariable=self.progress_text_var, style="Small.Card.TLabel").grid(
-            row=3, column=0, columnspan=3, sticky="w"
+            row=5, column=0, columnspan=3, sticky="w"
         )
 
         mid = ttk.Frame(root)
@@ -749,12 +1275,12 @@ class App(tk.Tk):
         ttk.Label(left, text="Mặc định chọn cả 5 thư mục như tool gốc mô tả.", style="Small.Card.TLabel").pack(anchor="w", pady=(2, 10))
 
         self.tree = ttk.Treeview(left, columns=("src", "status", "size"), show="headings", height=9)
-        self.tree.heading("src", text="Đường dẫn gốc")
-        self.tree.heading("status", text="Trạng thái")
+        self.tree.heading("src", text="Thư mục Zalo")
+        self.tree.heading("status", text="Trạng thái / Vị trí hiện tại")
         self.tree.heading("size", text="Dung lượng")
-        self.tree.column("src", width=360)
-        self.tree.column("status", width=120)
-        self.tree.column("size", width=90, anchor="e")
+        self.tree.column("src", width=190)
+        self.tree.column("status", width=290)
+        self.tree.column("size", width=80, anchor="e")
         self.tree.pack(fill="both", expand=True)
 
         checks = ttk.Frame(left, style="Card.TFrame")
@@ -774,25 +1300,36 @@ class App(tk.Tk):
 
         ttk.Label(right, text="Chế độ thao tác", style="Card.TLabel").pack(anchor="w")
         modes = ttk.Frame(right, style="Card.TFrame")
-        modes.pack(fill="x", pady=(8, 12))
+        modes.pack(fill="x", pady=(6, 8))
         ttk.Radiobutton(
             modes,
-            text="An toàn: copy sang đích, đổi gốc thành -Old, tạo liên kết",
-            value="copy_safe",
-            variable=self.mode_var,
+            text="Di chuyển sang ổ mới (Move / Đổi ổ cứng)",
+            value="migrate",
+            variable=self.main_mode_var,
+            command=self._update_mode_ui,
         ).pack(anchor="w", pady=2)
         ttk.Radiobutton(
             modes,
-            text="Move: chuyển hẳn sang đích, không giữ -Old",
-            value="move",
-            variable=self.mode_var,
-        ).pack(anchor="w", pady=2)
-        ttk.Radiobutton(
-            modes,
-            text="Tạo lại liên kết: dùng khi đã có dữ liệu ở ổ đích",
+            text="Chỉ tạo lại liên kết (Relink)",
             value="relink",
-            variable=self.mode_var,
+            variable=self.main_mode_var,
+            command=self._update_mode_ui,
         ).pack(anchor="w", pady=2)
+        ttk.Radiobutton(
+            modes,
+            text="Khôi phục & Dọn dẹp",
+            value="cleanup",
+            variable=self.main_mode_var,
+            command=self._update_mode_ui,
+        ).pack(anchor="w", pady=2)
+
+        # Dynamic options container
+        self.mode_details_frame = ttk.Frame(right, style="Card.TFrame", padding=(10, 8))
+        self.mode_details_frame.pack(fill="x", pady=(0, 8))
+
+        # Dynamic action buttons container
+        self.action_frame = ttk.Frame(right, style="Card.TFrame")
+        self.action_frame.pack(fill="x", pady=(0, 8))
 
         warn = ttk.Label(
             right,
@@ -801,19 +1338,12 @@ class App(tk.Tk):
             wraplength=390,
             justify="left",
         )
-        warn.pack(fill="x", pady=(0, 12))
+        warn.pack(fill="x", pady=(0, 8))
 
-        action_row = ttk.Frame(right, style="Card.TFrame")
-        action_row.pack(fill="x", pady=(0, 12))
-        ttk.Button(action_row, text="Dọn phiên bản Zalo cũ", command=self.start_clean_old_versions).pack(fill="x", pady=4)
-        ttk.Button(action_row, text="TỰ ĐỘNG DI CHUYỂN", style="Accent.TButton", command=self.start_move).pack(fill="x", pady=4)
-        ttk.Button(action_row, text="Khôi phục từ -Old", command=self.start_restore).pack(fill="x", pady=4)
-        ttk.Button(action_row, text="Xoá backup -Old", command=self.start_delete_backups).pack(fill="x", pady=4)
-
-        ttk.Label(right, text="Nhật ký", style="Card.TLabel").pack(anchor="w", pady=(4, 6))
+        ttk.Label(right, text="Nhật ký", style="Card.TLabel").pack(anchor="w", pady=(2, 4))
         self.log_text = tk.Text(
             right,
-            height=18,
+            height=14,
             bg="#020617",
             fg="#d1d5db",
             insertbackground="#f8fafc",
@@ -824,10 +1354,38 @@ class App(tk.Tk):
         self.log_text.pack(fill="both", expand=True)
         self.log(f"{APP_NAME} {APP_VERSION} ready.")
 
+        # Render dynamic options and buttons for the initial mode
+        self._update_mode_ui()
+
+    def get_effective_target_base(self) -> Path:
+        raw_text = self.target_var.get().strip()
+        if not raw_text:
+            raw_text = "D:/Zalo" if is_windows() else str(Path.home() / "Zalo")
+        raw = Path(raw_text).expanduser()
+        if not self.auto_subfolder_var.get():
+            return raw
+
+        clean_name = raw.name.rstrip("\\/").lower()
+        if clean_name != "zalo":
+            return raw / "Zalo"
+        return raw
+
+    def _update_target_preview(self) -> None:
+        eff = self.get_effective_target_base()
+        if self.auto_subfolder_var.get():
+            self.target_preview_var.set(
+                f"Đích thực tế sẽ lưu tại: {eff}  (Tất cả thư mục Zalo, ZaloData... sẽ nằm gọn trong đây)"
+            )
+        else:
+            self.target_preview_var.set(
+                f"Đích thực tế sẽ lưu tại: {eff}  (Lưu trực tiếp vào thư mục này, không tạo thư mục Zalo bao ngoài)"
+            )
+
     def choose_target(self) -> None:
         folder = filedialog.askdirectory(title="Chọn nơi lưu Zalo")
         if folder:
             self.target_var.set(folder)
+            self._update_target_preview()
             self.refresh_status()
 
     def selected_items(self) -> list[ZaloFolder]:
@@ -888,24 +1446,136 @@ class App(tk.Tk):
             return f"{minutes}m {secs}s"
         return f"{secs}s"
 
+    def _update_mode_ui(self) -> None:
+        mode = self.main_mode_var.get()
+
+        for child in self.mode_details_frame.winfo_children():
+            child.destroy()
+        for child in self.action_frame.winfo_children():
+            child.destroy()
+
+        if mode == "migrate":
+            ttk.Label(
+                self.mode_details_frame,
+                text="Tùy chọn di chuyển:",
+                style="Card.TLabel",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor="w", pady=(0, 4))
+            ttk.Radiobutton(
+                self.mode_details_frame,
+                text="Sao chép an toàn (giữ bản sao lưu ổ cũ)",
+                value="copy_safe",
+                variable=self.move_mode_var,
+            ).pack(anchor="w", pady=1)
+            ttk.Radiobutton(
+                self.mode_details_frame,
+                text="Chuyển hẳn (Move nhanh, giải phóng ổ cũ ngay)",
+                value="move",
+                variable=self.move_mode_var,
+            ).pack(anchor="w", pady=1)
+            ttk.Checkbutton(
+                self.mode_details_frame,
+                text="Tạo / Cập nhật liên kết (junction) ở ổ C trỏ sang đích mới",
+                variable=self.create_link_var,
+            ).pack(anchor="w", pady=(6, 2))
+
+            ttk.Button(
+                self.action_frame,
+                text="BẮT ĐẦU DI CHUYỂN",
+                style="Accent.TButton",
+                command=self.start_move,
+            ).pack(fill="x", pady=2)
+
+            sub_row = ttk.Frame(self.action_frame, style="Card.TFrame")
+            sub_row.pack(fill="x", pady=(4, 0))
+            ttk.Button(sub_row, text="Khôi phục từ -Old", command=self.start_restore).pack(
+                side="left", expand=True, fill="x", padx=(0, 4)
+            )
+            ttk.Button(sub_row, text="Xoá backup -Old", command=self.start_delete_backups).pack(
+                side="right", expand=True, fill="x", padx=(4, 0)
+            )
+
+        elif mode == "relink":
+            ttk.Label(
+                self.mode_details_frame,
+                text="Tạo lại liên kết (Không copy/move dữ liệu):",
+                style="Card.TLabel",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor="w", pady=(0, 2))
+            ttk.Label(
+                self.mode_details_frame,
+                text="Dùng khi dữ liệu đã có sẵn tại ổ đích (do tự copy hoặc vừa cài lại Windows). Tool sẽ tạo junction từ ổ C trỏ tới đích.",
+                style="Small.Card.TLabel",
+                wraplength=380,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 2))
+
+            # Only relink button!
+            ttk.Button(
+                self.action_frame,
+                text="TẠO LẠI LIÊN KẾT (RELINK)",
+                style="Accent.TButton",
+                command=self.start_relink,
+            ).pack(fill="x", pady=2)
+
+        elif mode == "cleanup":
+            ttk.Label(
+                self.mode_details_frame,
+                text="Khôi phục & Dọn dẹp ổ đĩa:",
+                style="Card.TLabel",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor="w", pady=(0, 2))
+            ttk.Label(
+                self.mode_details_frame,
+                text="Khôi phục dữ liệu Zalo về lại ổ C mặc định, hoặc xoá các bản sao lưu -Old và các phiên bản Zalo cũ để giải phóng dung lượng.",
+                style="Small.Card.TLabel",
+                wraplength=380,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 2))
+
+            ttk.Button(
+                self.action_frame,
+                text="Khôi phục dữ liệu về ổ C",
+                style="Accent.TButton",
+                command=self.start_restore,
+            ).pack(fill="x", pady=2)
+            ttk.Button(
+                self.action_frame,
+                text="Xoá các thư mục backup -Old",
+                command=self.start_delete_backups,
+            ).pack(fill="x", pady=2)
+            ttk.Button(
+                self.action_frame,
+                text="Dọn phiên bản Zalo cũ",
+                command=self.start_clean_old_versions,
+            ).pack(fill="x", pady=2)
+
     def refresh_status(self) -> None:
         for row in self.tree.get_children():
             self.tree.delete(row)
         for item in ZALO_FOLDERS:
             src = item.source
             if is_reparse_point(src):
-                status = "Linked"
-                size = "-"
+                target = get_junction_target(src)
+                if target and target.exists():
+                    status = f"Linked -> {target}"
+                    size = human_size(folder_size(target))
+                elif target:
+                    status = f"Link gãy (Mất đích: {target})"
+                    size = "-"
+                else:
+                    status = "Linked"
+                    size = "-"
             elif src.exists():
-                status = "Source OK"
+                status = "Gốc ở C:"
                 size = human_size(folder_size(src))
             elif item.backup_path().exists():
-                status = "Backup -Old"
+                status = "Chỉ có -Old"
                 size = human_size(folder_size(item.backup_path()))
             else:
-                status = "Missing"
+                status = "Chưa có dữ liệu"
                 size = "-"
-            self.tree.insert("", "end", values=(str(src), status, size))
+            self.tree.insert("", "end", values=(f"{item.label} ({src.name})", status, size))
         admin = "Admin: OK" if is_admin() else "Admin: NO — nên chạy Run as administrator để tạo junction ổn định."
         running_procs = get_running_zalo_processes()
         if running_procs:
@@ -913,7 +1583,19 @@ class App(tk.Tk):
             running = f"Zalo đang chạy ({names}) — hãy tắt Zalo hoặc nhấn 'Đóng Zalo' bên dưới."
         else:
             running = "Zalo process: không thấy đang chạy."
-        self.status_var.set(f"{admin}\n{running}\nLưu ý: nên dùng đường dẫn ngắn, không dấu, không ký tự lạ, ví dụ D:\\Zalo.")
+        backups = find_all_zalo_backups(
+            ZALO_FOLDERS,
+            target_base=self.get_effective_target_base(),
+            extra_dirs=self.last_source_bases,
+        )
+        backup_hint = (
+            f"\nPhát hiện {len(backups)} bản backup -Old trên đĩa (bấm 'Xoá backup -Old' để dọn dẹp)."
+            if backups
+            else ""
+        )
+        self.status_var.set(
+            f"{admin}\n{running}{backup_hint}\nLưu ý: nên dùng đường dẫn ngắn, không dấu, không ký tự lạ, ví dụ D:\\Zalo hoặc F:\\Zalo."
+        )
 
     def close_zalo_manually(self) -> None:
         running_processes = get_running_zalo_processes()
@@ -1015,14 +1697,56 @@ class App(tk.Tk):
         self.progress_var.set(0.0)
         self.progress_text_var.set("Đang chuẩn bị...")
         self.progress_started_at = None
-        target = Path(self.target_var.get()).expanduser()
-        mode = self.mode_var.get()
+        target = self.get_effective_target_base()
+        mode = self.move_mode_var.get()
+        create_link = self.create_link_var.get()
         items = self.selected_items()
         worker = Worker(self.log, self.report_progress)
+
+        def on_move_success() -> None:
+            self.last_migration_backups = list(worker.created_backups)
+            self.last_source_bases = list(worker.source_bases)
+            self.verify_zalo_after_move(items)
+
         self.run_worker(
-            lambda: worker.move_selected(items, target, mode),
-            lambda: self.verify_zalo_after_move(items),
+            lambda: worker.move_selected(items, target, mode, create_link),
+            on_move_success,
         )
+
+    def start_relink(self) -> None:
+        if not self.confirm_preflight(False):
+            return
+        target = self.get_effective_target_base()
+        items = self.selected_items()
+        existing_targets = [item for item in items if item.target(target).exists()]
+        if not existing_targets:
+            messagebox.showerror(
+                APP_NAME,
+                f"Không tìm thấy dữ liệu tại thư mục đích:\n{target}\n\n"
+                "Chế độ 'Tạo lại liên kết' yêu cầu dữ liệu đã tồn tại sẵn ở thư mục đích.\n"
+                "Hãy chọn đúng thư mục chứa dữ liệu Zalo hoặc chọn chế độ 'Di chuyển sang ổ mới'."
+            )
+            return
+
+        worker = Worker(self.log, self.report_progress)
+        self.run_worker(
+            lambda: worker.relink_selected(items, target),
+            lambda: self.verify_zalo_after_relink(items),
+        )
+
+    def verify_zalo_after_relink(self, items: list[ZaloFolder]) -> None:
+        self.progress_var.set(100.0)
+        self.progress_text_var.set("Đã tạo liên kết — mở Zalo để kiểm tra")
+        zalo_exe = ZALO_INSTALL_ROOT / "Zalo.exe"
+        try:
+            if zalo_exe.exists():
+                os.startfile(str(zalo_exe))
+                self.log(f"Đã mở Zalo để kiểm tra: {zalo_exe}")
+            else:
+                self.log(f"Không tìm thấy Zalo.exe tại {zalo_exe}")
+        except Exception as exc:
+            self.log(f"Không thể tự mở Zalo: {exc}")
+        messagebox.showinfo(APP_NAME, "Đã tạo lại liên kết thành công! Hãy kiểm tra hoạt động của Zalo.")
 
     def verify_zalo_after_move(self, items: list[ZaloFolder]) -> None:
         self.progress_var.set(100.0)
@@ -1037,29 +1761,39 @@ class App(tk.Tk):
             self.log(f"Không thể tự mở Zalo: {exc}")
             messagebox.showwarning(
                 APP_NAME,
-                f"Không thể tự mở Zalo. Backup -Old vẫn được giữ lại.\n\n{exc}",
+                f"Không thể tự mở Zalo. Backup -Old vẫn được giữ lại an toàn.\n\n{exc}",
             )
             return
 
-        backups = [item for item in items if item.backup_path().exists()]
+        target = self.get_effective_target_base()
+        extra_dirs = list(self.last_source_bases)
+        backups = find_all_zalo_backups(items, target_base=target, extra_dirs=extra_dirs)
         if not backups:
-            messagebox.showinfo(APP_NAME, "Đã mở Zalo. Không có backup -Old mới để xử lý.")
+            messagebox.showinfo(APP_NAME, "Đã mở Zalo. Không có backup -Old nào để xử lý.")
             return
 
-        labels = "\n".join(f"• {item.label}: {item.backup_path()}" for item in backups)
+        def do_delete(selected_paths: list[Path]) -> None:
+            worker = Worker(self.log)
+            self.run_worker(
+                lambda: worker.delete_backup_paths(selected_paths),
+                lambda: messagebox.showinfo(
+                    APP_NAME,
+                    f"Đã xoá hoàn tất {len(selected_paths)} thư mục backup đã chọn!",
+                ),
+            )
+
         delete_now = messagebox.askyesno(
             APP_NAME,
-            "Zalo đã được mở. Hãy kiểm tra đăng nhập, tin nhắn, ảnh và gửi/nhận file.\n\n"
-            "Zalo hoạt động bình thường và bạn muốn XOÁ backup -Old ngay?\n\n"
-            f"{labels}\n\n"
-            "Chọn No để giữ backup và xoá thủ công hoặc bằng tool sau.",
+            f"Zalo đã được mở. Hãy kiểm tra đăng nhập, tin nhắn và gửi/nhận file.\n\n"
+            f"Phát hiện {len(backups)} bản sao lưu -Old trên đĩa.\n"
+            "Bạn có muốn xem danh sách và chọn các bản sao lưu cần xoá ngay không?\n\n"
+            "(Chọn 'No' nếu muốn giữ lại toàn bộ và dọn dẹp sau)",
             default=messagebox.NO,
         )
         if delete_now:
-            worker = Worker(self.log)
-            self.run_worker(lambda: worker.delete_backups(backups))
+            BackupManagerDialog(self, backups, do_delete)
         else:
-            self.log("Người dùng chọn giữ lại backup -Old.")
+            self.log("Người dùng chọn giữ lại toàn bộ bản sao lưu -Old.")
 
     def start_restore(self) -> None:
         if not self.confirm_preflight(True):
@@ -1069,11 +1803,41 @@ class App(tk.Tk):
         self.run_worker(lambda: worker.restore_selected(items))
 
     def start_delete_backups(self) -> None:
-        if not self.confirm_preflight(True):
+        if not is_windows():
+            messagebox.showerror(APP_NAME, "Tool này chỉ dành cho Windows.")
             return
-        items = self.selected_items()
-        worker = Worker(self.log)
-        self.run_worker(lambda: worker.delete_backups(items))
+
+        items = self.selected_items() or ZALO_FOLDERS
+        target = self.get_effective_target_base()
+        extra_dirs = list(self.last_source_bases)
+
+        backups = find_all_zalo_backups(items, target_base=target, extra_dirs=extra_dirs)
+
+        def do_delete(selected_paths: list[Path]) -> None:
+            worker = Worker(self.log)
+            self.run_worker(
+                lambda: worker.delete_backup_paths(selected_paths),
+                lambda: messagebox.showinfo(
+                    APP_NAME,
+                    f"Đã xoá hoàn tất {len(selected_paths)} thư mục backup đã chọn!",
+                ),
+            )
+
+        if not backups:
+            choose_manual = messagebox.askyesno(
+                APP_NAME,
+                "Không tự động tìm thấy thư mục backup -Old ở các vị trí mặc định (C:, ổ đích, hoặc D..Z:\\Zalo).\n\n"
+                "Bạn có muốn tự duyệt chọn thư mục để quét xoá không?",
+            )
+            if choose_manual:
+                chosen = filedialog.askdirectory(title="Chọn thư mục để quét backup Zalo")
+                if chosen:
+                    backups = find_all_zalo_backups(items, target_base=target, extra_dirs=[Path(chosen)])
+            if not backups:
+                messagebox.showinfo(APP_NAME, "Không tìm thấy thư mục backup -Old nào.")
+                return
+
+        BackupManagerDialog(self, backups, do_delete)
 
     def start_clean_old_versions(self) -> None:
         if not is_windows():
